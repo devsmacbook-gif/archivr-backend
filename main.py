@@ -15,7 +15,6 @@ import os, json, time, hashlib, re, threading, logging
 from datetime import datetime, timezone
 from urllib.parse import quote as url_quote
 
-import feedparser
 import requests
 import stripe
 from anthropic import Anthropic
@@ -50,6 +49,7 @@ TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")  # your own alert
 
 SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "15"))
 MIN_FLIP_SCORE        = int(os.environ.get("MIN_FLIP_SCORE", "65"))
+APIFY_TOKEN           = os.environ.get("APIFY_TOKEN", "")
 
 # ─── CLIENTS ─────────────────────────────────────────────────────────────────
 
@@ -589,8 +589,265 @@ def scraper_loop():
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 
+def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Fetch Mercari Japan listings using Playwright headless Chrome."""
+    from playwright.sync_api import sync_playwright
+    JPY_TO_GBP = 0.0052
+    listings = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-GB",
+            )
+            page = context.new_page()
+            url = f"https://jp.mercari.com/search?keyword={url_quote(query)}&status=on_sale&sort=created_time&order=desc"
+            page.goto(url, wait_until="networkidle", timeout=25000)
+            page.wait_for_timeout(3000)
+
+            all_links = page.eval_on_selector_all(
+                "a[href*='/item/m']",
+                "els => els.map(e => ({href: e.href, text: e.innerText.trim()}))"
+            )
+            content = page.content()
+            browser.close()
+
+        # Extract item IDs from links
+        item_ids = []
+        seen_ids = set()
+        for link in all_links:
+            m = re.search(r"/(m\d+)", link.get("href", ""))
+            if m and m.group(1) not in seen_ids:
+                seen_ids.add(m.group(1))
+                item_ids.append(m.group(1))
+
+        # Extract prices and names from page JSON
+        names_map  = {}
+        prices_map = {}
+        for pat in [
+            r'"id":"(m\d+)"[^}]*?"name":"([^"]{5,100})"[^}]*?"price":(\d+)',
+            r'"itemId":"(m\d+)"[^}]*?"itemName":"([^"]{5,100})"[^}]*?"price":(\d+)',
+        ]:
+            for item_id, name, price in re.findall(pat, content):
+                names_map[item_id]  = name
+                prices_map[item_id] = int(price)
+
+        for item_id in item_ids[:20]:
+            name      = names_map.get(item_id, "")
+            price_jpy = prices_map.get(item_id, 0)
+            if not name or not price_jpy or price_jpy < 100:
+                continue
+            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":    name,
+                "price":    price_gbp,
+                "price_jpy": price_jpy,
+                "link":     f"https://jp.mercari.com/item/{item_id}",
+                "platform": "Mercari JP",
+            })
+    except Exception as e:
+        log.error(f"Mercari JP fetch error: {e}")
+
+    return listings[:10]
+
+
+
+# ─── APIFY SCRAPER ────────────────────────────────────────────────────────────
+# Uses Apify cloud scrapers — no IP blocking, no rate limits, flat monthly cost
+
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
+
+APIFY_ACTORS = {
+    "mercari_jp": "curious_coder/mercari-scraper",
+    "yahoo_jp":   "styleindexamerica/jp-yahooauctions-scraper", 
+    "vinted":     "emastra/vinted-scraper",
+    "depop":      "apify/depop-scraper",
+}
+
+def _apify_run(actor_id: str, input_data: dict, timeout_secs: int = 60) -> list[dict]:
+    """Run an Apify actor and return results."""
+    if not APIFY_TOKEN:
+        log.warning("APIFY_TOKEN not set — skipping Apify scrape")
+        return []
+
+    try:
+        # Start the actor run
+        run_url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
+        resp = requests.post(
+            run_url,
+            json=input_data,
+            headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
+            timeout=timeout_secs,
+            params={"token": APIFY_TOKEN},
+        )
+        if resp.status_code == 200:
+            return resp.json() if isinstance(resp.json(), list) else []
+        else:
+            log.error(f"Apify error {resp.status_code}: {resp.text[:200]}")
+            return []
+    except Exception as e:
+        log.error(f"Apify request failed: {e}")
+        return []
+
+
+def _search_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Search Mercari Japan via Apify."""
+    JPY_TO_GBP = 0.0052
+    
+    results = _apify_run(
+        APIFY_ACTORS["mercari_jp"],
+        {
+            "keyword": query,
+            "maxItems": 30,
+            "status": "on_sale",
+            "sortBy": "created_time",
+        }
+    )
+
+    listings = []
+    for item in results:
+        try:
+            title     = item.get("name") or item.get("title") or item.get("itemName", "")
+            price_jpy = int(item.get("price") or item.get("sellingPrice") or 0)
+            item_id   = item.get("id") or item.get("itemId", "")
+            if not title or not price_jpy:
+                continue
+            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":     title,
+                "price":     price_gbp,
+                "price_jpy": price_jpy,
+                "link":      f"https://jp.mercari.com/item/{item_id}" if item_id else "",
+                "platform":  "Mercari JP",
+            })
+        except Exception:
+            continue
+    return listings
+
+
+def _search_yahoo_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Search Yahoo Auctions Japan via Apify."""
+    JPY_TO_GBP = 0.0052
+
+    results = _apify_run(
+        APIFY_ACTORS["yahoo_jp"],
+        {
+            "keyword": query,
+            "maxItems": 30,
+        }
+    )
+
+    listings = []
+    for item in results:
+        try:
+            title     = item.get("title") or item.get("name", "")
+            price_raw = item.get("price") or item.get("currentPrice") or item.get("buyNowPrice") or 0
+            price_jpy = int(re.sub(r"[^\d]", "", str(price_raw))) if price_raw else 0
+            link      = item.get("url") or item.get("itemUrl", "")
+            if not title or not price_jpy:
+                continue
+            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":     title,
+                "price":     price_gbp,
+                "price_jpy": price_jpy,
+                "link":      link,
+                "platform":  "Yahoo JP",
+            })
+        except Exception:
+            continue
+    return listings
+
+
+def _search_vinted(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Search Vinted UK via Apify."""
+    input_data = {
+        "searchQuery": query,
+        "maxItems": 30,
+        "country": "uk",
+    }
+    if max_price_gbp:
+        input_data["maxPrice"] = max_price_gbp
+
+    results = _apify_run(APIFY_ACTORS["vinted"], input_data)
+
+    listings = []
+    for item in results:
+        try:
+            title     = item.get("title") or item.get("name", "")
+            price_gbp = float(item.get("price") or item.get("priceAmount") or 0)
+            link      = item.get("url") or item.get("itemUrl", "")
+            if not title or not price_gbp:
+                continue
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":    title,
+                "price":    round(price_gbp, 2),
+                "link":     link,
+                "platform": "Vinted",
+            })
+        except Exception:
+            continue
+    return listings
+
+
+def _search_depop(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Search Depop via Apify."""
+    results = _apify_run(
+        APIFY_ACTORS["depop"],
+        {
+            "searchQuery": query,
+            "maxItems": 30,
+        }
+    )
+
+    listings = []
+    for item in results:
+        try:
+            title     = item.get("title") or item.get("name", "")
+            price_gbp = float(item.get("price") or item.get("priceAmount") or 0)
+            link      = item.get("url") or item.get("itemUrl", "")
+            if not title or not price_gbp:
+                continue
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":    title,
+                "price":    round(price_gbp, 2),
+                "link":     link,
+                "platform": "Depop",
+            })
+        except Exception:
+            continue
+    return listings
+
+
+def _search_all_platforms(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Search all platforms and combine results."""
+    all_listings = []
+    
+    # Always search Mercari JP and Yahoo JP (Japan arbitrage)
+    all_listings.extend(_search_mercari_jp(query, max_price_gbp))
+    all_listings.extend(_search_yahoo_jp(query, max_price_gbp))
+    
+    # UK platforms
+    all_listings.extend(_search_vinted(query, max_price_gbp))
+    all_listings.extend(_search_depop(query, max_price_gbp))
+    
+    return all_listings
+
+
 def _run_scraper_cycle():
-    # Get all active alerts with user Telegram credentials
+    """Scan all platforms via Apify for all active user alerts."""
     rows = (
         supabase.table("alerts")
         .select("*, users(telegram_bot_token, telegram_chat_id)")
@@ -601,66 +858,79 @@ def _run_scraper_cycle():
     if not alerts:
         return
 
-    log.info(f"Scraper: scanning {len(alerts)} alerts")
+    log.info(f"Scraper: scanning {len(alerts)} alerts across all platforms")
 
+    # Deduplicate search terms across all users to minimise Apify calls
+    # e.g. 100 users all watching Stone Island = 1 search, not 100
+    search_map: dict[str, list[dict]] = {}
     for alert in alerts:
-        user_data    = alert.get("users") or {}
-        bot_token    = user_data.get("telegram_bot_token") or TELEGRAM_BOT_TOKEN
-        chat_id      = user_data.get("telegram_chat_id") or TELEGRAM_CHAT_ID
-        brand        = alert["brand"]
-        keywords     = alert.get("keywords", [])
-        max_price    = alert.get("max_price_gbp", 9999)
+        brand    = alert["brand"]
+        keywords = alert.get("keywords", [])
+        terms    = [brand] + [f"{brand} {kw}" for kw in keywords[:1]]
+        for term in terms[:2]:
+            if term not in search_map:
+                search_map[term] = []
+            search_map[term].append(alert)
 
-        search_terms = [f"{brand} {kw}" for kw in keywords[:2]] + [brand]
+    log.info(f"Scraper: {len(search_map)} unique search terms")
 
-        for term in search_terms[:2]:
-            encoded = url_quote(term)
-            feeds = [
-                {"platform": "eBay UK",  "url": f"https://www.ebay.co.uk/sch/i.html?_nkw={encoded}&_sop=10&_rss=1&LH_BIN=1"},
-                {"platform": "eBay US",  "url": f"https://www.ebay.com/sch/i.html?_nkw={encoded}&_sop=10&_rss=1"},
-                {"platform": "Vinted",   "url": f"https://www.vinted.co.uk/catalog/rss?search_text={encoded}"},
-            ]
+    for term, matching_alerts in search_map.items():
+        try:
+            max_price = max(a.get("max_price_gbp", 9999) for a in matching_alerts)
+            listings  = _search_all_platforms(term, max_price)
+            log.info(f"  '{term}': {len(listings)} listings across all platforms")
 
-            for feed_info in feeds:
-                try:
-                    feed    = feedparser.parse(feed_info["url"])
-                    entries = feed.entries[:15]
+            for listing in listings:
+                title = listing["title"]
+                lid   = hashlib.md5(f"{listing.get('link','')}{title}".encode()).hexdigest()
 
-                    for entry in entries:
-                        title = entry.get("title", "")
-                        url   = entry.get("link", "")
-                        lid   = hashlib.md5(f"{url}{title}".encode()).hexdigest()
-
-                        if lid in _seen_listings:
-                            continue
-                        _seen_listings.add(lid)
-
-                        title_lower = title.lower()
-                        if not (brand.lower() in title_lower or
-                                any(k.lower() in title_lower for k in keywords)):
-                            continue
-
-                        price_text = title + " " + entry.get("summary", "") + " " + entry.get("price", "")
-                        price = extract_price_gbp(price_text)
-
-                        if price and price > max_price:
-                            continue
-
-                        analysis = run_quick_analysis(title, price or "unknown", feed_info["platform"], alert)
-
-                        if (analysis.get("flipScore", 0) >= MIN_FLIP_SCORE and
-                                analysis.get("verdict") not in ["SKIP", "WAIT"]):
-                            msg = build_telegram_message(title, price, feed_info["platform"], analysis, url, alert)
-                            send_telegram_alert(msg, chat_id, bot_token)
-                            log.info(f"Alert sent: {analysis['verdict']} — {title[:50]}")
-
-                        time.sleep(0.3)
-
-                except Exception as e:
-                    log.error(f"Feed error ({feed_info['platform']}): {e}")
+                if lid in _seen_listings:
                     continue
+                _seen_listings.add(lid)
 
-    # Trim seen set to avoid memory bloat
+                # Check which alerts this listing matches
+                for alert in matching_alerts:
+                    brand     = alert["brand"]
+                    keywords  = alert.get("keywords", [])
+                    max_price = alert.get("max_price_gbp", 9999)
+                    user_data = alert.get("users") or {}
+                    bot_token = user_data.get("telegram_bot_token") or TELEGRAM_BOT_TOKEN
+                    chat_id   = user_data.get("telegram_chat_id") or TELEGRAM_CHAT_ID
+
+                    # Price check
+                    if listing["price"] > max_price:
+                        continue
+
+                    # Keyword match
+                    title_lower = title.lower()
+                    if not (brand.lower() in title_lower or
+                            any(k.lower() in title_lower for k in keywords)):
+                        continue
+
+                    try:
+                        analysis = run_quick_analysis(
+                            title, listing["price"], listing["platform"], alert
+                        )
+                    except Exception as e:
+                        log.error(f"Analysis error: {e}")
+                        continue
+
+                    if (analysis.get("flipScore", 0) >= MIN_FLIP_SCORE and
+                            analysis.get("verdict") in ["BUY NOW", "WORTH IT"]):
+                        msg = build_telegram_message(
+                            title, listing["price"], listing["platform"],
+                            analysis, listing.get("link", ""), alert
+                        )
+                        send_telegram_alert(msg, chat_id, bot_token)
+                        log.info(f"Alert sent to user: {analysis['verdict']} — {title[:50]}")
+
+                time.sleep(0.2)
+
+        except Exception as e:
+            log.error(f"Scraper cycle error for '{term}': {e}")
+            continue
+
+    # Trim seen set
     if len(_seen_listings) > 10000:
         trimmed = list(_seen_listings)[-5000:]
         _seen_listings.clear()
