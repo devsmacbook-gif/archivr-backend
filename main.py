@@ -1,0 +1,609 @@
+"""
+ARCHIVR SaaS Backend
+====================
+Single Python service that handles:
+  - User auth (via Supabase)
+  - Stripe subscription webhooks
+  - Extension API (analyse a listing)
+  - Autonomous scraper (background thread)
+  - Telegram alerts
+
+Deploy to Railway.app for ~$5/month.
+"""
+
+import os, json, time, hashlib, re, threading, logging
+from datetime import datetime, timezone
+from urllib.parse import quote as url_quote
+
+import feedparser
+import requests
+import stripe
+from anthropic import Anthropic
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from supabase import create_client, Client
+
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [ARCHIVR] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("archivr")
+
+# ─── ENV VARS ─────────────────────────────────────────────────────────────────
+# Set these in Railway dashboard — never hardcode keys
+
+ANTHROPIC_API_KEY     = os.environ["ANTHROPIC_API_KEY"]
+SUPABASE_URL          = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY  = os.environ["SUPABASE_SERVICE_KEY"]   # service_role key
+STRIPE_SECRET_KEY     = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+STRIPE_PRICE_ID       = os.environ["STRIPE_PRICE_ID"]        # your £20/mo price ID
+
+# Optional — if not set, Telegram alerts are skipped
+TELEGRAM_BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")  # your own alerts
+
+SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "15"))
+MIN_FLIP_SCORE        = int(os.environ.get("MIN_FLIP_SCORE", "65"))
+
+# ─── CLIENTS ─────────────────────────────────────────────────────────────────
+
+anthropic_client: Anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+stripe.api_key = STRIPE_SECRET_KEY
+
+app = FastAPI(title="ARCHIVR API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten to your dashboard domain in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── MODELS ──────────────────────────────────────────────────────────────────
+
+class AnalyseRequest(BaseModel):
+    title: str
+    price: str | None = None
+    condition: str | None = None
+    description: str | None = None
+    platform: str | None = None
+    url: str | None = None
+
+class AlertCreate(BaseModel):
+    brand: str
+    keywords: list[str]
+    max_price_gbp: float
+    size: str | None = None
+
+class CheckoutRequest(BaseModel):
+    email: str
+    success_url: str
+    cancel_url: str
+
+# ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
+
+def get_user_from_token(token: str) -> dict:
+    """Validate Supabase JWT and return user row from our users table."""
+    try:
+        user = supabase.auth.get_user(token)
+        if not user or not user.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        row = (
+            supabase.table("users")
+            .select("*")
+            .eq("id", user.user.id)
+            .single()
+            .execute()
+        )
+        if not row.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        return row.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Auth error: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+
+def require_active_subscription(user: dict):
+    """Raise 403 if user doesn't have an active subscription."""
+    if user.get("subscription_status") not in ("active", "trialing"):
+        raise HTTPException(
+            status_code=403,
+            detail="Active subscription required. Subscribe at archivr.app"
+        )
+
+# ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
+
+def run_ai_analysis(listing: dict, user_platforms: list[str] | None = None) -> dict:
+    """Call Claude to analyse a listing. Uses Sonnet for quality."""
+    platforms = user_platforms or ["Depop", "eBay", "Grailed", "Instagram", "Own Site"]
+
+    prompt = f"""You are an expert vintage/archive streetwear dealer specialising in 2000s archive pieces.
+
+Listing:
+- Platform: {listing.get('platform', 'Unknown')}
+- Title: {listing.get('title', 'Unknown')}
+- Listed Price: {listing.get('price', 'Unknown')}
+- Condition: {listing.get('condition', 'Not specified')}
+- Description: {listing.get('description', 'None')}
+
+Analyse resale potential on: {', '.join(platforms)}
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{
+  "itemName": "clean item name",
+  "era": "estimated year/season",
+  "buyPrice": number in GBP,
+  "sellPrice": number in GBP,
+  "profit": number in GBP,
+  "sellSpeed": 0-100,
+  "marketDemand": 0-100,
+  "flipScore": 0-100,
+  "verdict": "BUY NOW"|"WORTH IT"|"WAIT"|"SKIP",
+  "verdictReason": "one punchy sentence",
+  "japanArbitrage": true|false,
+  "japanNote": "one sentence if relevant",
+  "platformBreakdown": {{"Depop": number, "eBay": number, "Grailed": number, "Instagram": number, "Own Site": number}},
+  "marketInsight": "2-3 sentence market analysis",
+  "watchOuts": ["risk 1", "risk 2"],
+  "buyTips": ["tip 1", "tip 2"]
+}}"""
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
+
+
+def run_quick_analysis(title: str, price, platform: str, alert: dict) -> dict:
+    """Lightweight Haiku analysis for the scraper — cheaper and faster."""
+    prompt = f"""Archive streetwear dealer. Quick analysis.
+
+Item: {title}
+Platform: {platform}  
+Listed: £{price}
+Budget: £{alert.get('max_price_gbp', '?')}
+
+Return ONLY JSON:
+{{"flipScore": 0-100, "sellSpeed": 0-100, "estimatedSellPrice": number, "estimatedProfit": number, "verdict": "BUY NOW"|"WORTH IT"|"WAIT"|"SKIP", "reason": "one sentence", "japanArbitrage": true|false}}"""
+
+    response = anthropic_client.messages.create(
+        model="claude-haiku-4-5-20251001",   # 10x cheaper than Sonnet
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class TelegramUpdate(BaseModel):
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+@app.post("/auth/login")
+async def login(body: LoginRequest):
+    """Sign in with email + password, returns Supabase JWT."""
+    try:
+        session = supabase.auth.sign_in_with_password({
+            "email": body.email,
+            "password": body.password,
+        })
+        return {
+            "access_token": session.session.access_token,
+            "user": {"email": session.user.email, "id": str(session.user.id)},
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+
+@app.patch("/me/telegram")
+async def update_telegram(body: TelegramUpdate, authorization: str = Header(...)):
+    """Save the user's Telegram credentials for deal alerts."""
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+
+    update_data = {}
+    if body.telegram_bot_token is not None:
+        update_data["telegram_bot_token"] = body.telegram_bot_token
+    if body.telegram_chat_id is not None:
+        update_data["telegram_chat_id"] = body.telegram_chat_id
+
+    if update_data:
+        supabase.table("users").update(update_data).eq("id", user["id"]).execute()
+
+    return {"updated": True}
+
+
+# ─── ROUTES — PUBLIC ─────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "ARCHIVR API"}
+
+
+@app.post("/checkout")
+async def create_checkout(body: CheckoutRequest):
+    """Create a Stripe Checkout session for new subscribers."""
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            customer_email=body.email,
+            success_url=body.success_url + "?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=body.cancel_url,
+            metadata={"email": body.email},
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        log.error(f"Checkout error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Handle Stripe events — activate/deactivate subscriptions."""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        log.error(f"Webhook signature error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    etype = event["type"]
+    data  = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        _handle_new_subscription(data)
+
+    elif etype in ("customer.subscription.updated", "customer.subscription.deleted"):
+        _handle_subscription_change(data)
+
+    return {"received": True}
+
+
+def _handle_new_subscription(session: dict):
+    """New subscriber — create or activate user in Supabase."""
+    email      = session.get("customer_email") or session.get("metadata", {}).get("email")
+    customer   = session.get("customer")
+    sub_id     = session.get("subscription")
+
+    if not email:
+        log.warning("Webhook: no email on checkout session")
+        return
+
+    existing = supabase.table("users").select("id").eq("email", email).execute()
+
+    if existing.data:
+        supabase.table("users").update({
+            "subscription_status": "active",
+            "stripe_customer_id": customer,
+            "stripe_subscription_id": sub_id,
+        }).eq("email", email).execute()
+        log.info(f"Subscription activated: {email}")
+    else:
+        # New user — sign them up in Supabase Auth
+        auth_user = supabase.auth.admin.create_user({
+            "email": email,
+            "email_confirm": True,
+            "password": _random_temp_password(),
+        })
+        supabase.table("users").insert({
+            "id": auth_user.user.id,
+            "email": email,
+            "subscription_status": "active",
+            "stripe_customer_id": customer,
+            "stripe_subscription_id": sub_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        log.info(f"New user created: {email}")
+
+        # Send magic link so they can set password
+        supabase.auth.admin.generate_link({
+            "type": "magiclink",
+            "email": email,
+        })
+
+
+def _handle_subscription_change(sub: dict):
+    """Update subscription status when Stripe fires an update/delete event."""
+    customer = sub.get("customer")
+    status   = sub.get("status", "inactive")
+
+    supabase.table("users").update({
+        "subscription_status": status,
+    }).eq("stripe_customer_id", customer).execute()
+
+    log.info(f"Subscription updated for customer {customer}: {status}")
+
+
+def _random_temp_password() -> str:
+    import secrets, string
+    chars = string.ascii_letters + string.digits
+    return "".join(secrets.choice(chars) for _ in range(24))
+
+# ─── ROUTES — AUTHENTICATED ──────────────────────────────────────────────────
+
+@app.post("/analyse")
+async def analyse_listing(
+    body: AnalyseRequest,
+    authorization: str = Header(...),
+):
+    """Extension calls this to analyse a listing page."""
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+    require_active_subscription(user)
+
+    try:
+        result = run_ai_analysis(body.dict())
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except Exception as e:
+        log.error(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
+
+    # Save to history
+    try:
+        supabase.table("analyses").insert({
+            "user_id": user["id"],
+            "listing_title": body.title,
+            "listing_url": body.url,
+            "platform": body.platform,
+            "listed_price": body.price,
+            "result": result,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        log.warning(f"Failed to save analysis to history: {e}")
+
+    return result
+
+
+@app.get("/alerts")
+async def get_alerts(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+    require_active_subscription(user)
+
+    rows = (
+        supabase.table("alerts")
+        .select("*")
+        .eq("user_id", user["id"])
+        .eq("active", True)
+        .execute()
+    )
+    return rows.data
+
+
+@app.post("/alerts")
+async def create_alert(
+    body: AlertCreate,
+    authorization: str = Header(...),
+):
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+    require_active_subscription(user)
+
+    row = supabase.table("alerts").insert({
+        "user_id":       user["id"],
+        "brand":         body.brand,
+        "keywords":      body.keywords,
+        "max_price_gbp": body.max_price_gbp,
+        "size":          body.size,
+        "active":        True,
+        "created_at":    datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    return row.data[0]
+
+
+@app.delete("/alerts/{alert_id}")
+async def delete_alert(alert_id: str, authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+
+    supabase.table("alerts").update({"active": False}).eq("id", alert_id).eq("user_id", user["id"]).execute()
+    return {"deleted": True}
+
+
+@app.get("/analyses")
+async def get_analysis_history(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+    require_active_subscription(user)
+
+    rows = (
+        supabase.table("analyses")
+        .select("*")
+        .eq("user_id", user["id"])
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return rows.data
+
+
+@app.get("/me")
+async def get_me(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "").strip()
+    user  = get_user_from_token(token)
+    return {
+        "email": user["email"],
+        "subscription_status": user["subscription_status"],
+        "created_at": user["created_at"],
+    }
+
+# ─── SCRAPER ─────────────────────────────────────────────────────────────────
+
+_seen_listings: set[str] = set()
+
+
+def extract_price_gbp(text: str) -> float | None:
+    if not text:
+        return None
+    gbp = re.findall(r"£\s*(\d[\d,]*\.?\d*)", str(text))
+    if gbp:
+        return round(float(gbp[0].replace(",", "")), 2)
+    usd = re.findall(r"\$\s*(\d[\d,]*\.?\d*)", str(text))
+    if usd:
+        return round(float(usd[0].replace(",", "")) * 0.79, 2)
+    eur = re.findall(r"€\s*(\d[\d,]*\.?\d*)", str(text))
+    if eur:
+        return round(float(eur[0].replace(",", "")) * 0.86, 2)
+    return None
+
+
+def send_telegram_alert(message: str, chat_id: str, bot_token: str):
+    if not bot_token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }, timeout=10)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+
+
+def build_telegram_message(title, price, platform, analysis, url, alert) -> str:
+    emoji = {"BUY NOW": "🟢", "WORTH IT": "🟡", "WAIT": "🟠", "SKIP": "🔴"}.get(
+        analysis.get("verdict", ""), "⚪"
+    )
+    japan = "\n🇯🇵 <b>JAPAN ARBITRAGE</b>" if analysis.get("japanArbitrage") else ""
+    return f"""{emoji} <b>ARCHIVR DEAL ALERT</b>
+
+<b>{title[:80]}</b>
+
+💰 Listed: <b>£{price}</b>
+📈 Flip Score: <b>{analysis.get('flipScore', '?')}/100</b>
+⚡ Sell Speed: <b>{analysis.get('sellSpeed', '?')}/100</b>
+💵 Est. Profit: <b>+£{analysis.get('estimatedProfit', '?')}</b>
+🏷 Sell At: <b>£{analysis.get('estimatedSellPrice', '?')}</b>
+📍 {platform}
+🎯 <b>{analysis.get('verdict', '?')}</b> — {analysis.get('reason', '')}
+{japan}
+
+🔗 <a href="{url}">View Listing</a>
+<i>ARCHIVR · {datetime.now().strftime('%H:%M %d %b')}</i>"""
+
+
+def scraper_loop():
+    """Background thread — scans RSS feeds for all active users' alerts."""
+    log.info("Scraper thread started")
+    time.sleep(30)  # Let the server boot first
+
+    while True:
+        try:
+            _run_scraper_cycle()
+        except Exception as e:
+            log.error(f"Scraper cycle error: {e}")
+        time.sleep(SCAN_INTERVAL_MINUTES * 60)
+
+
+def _run_scraper_cycle():
+    # Get all active alerts with user Telegram credentials
+    rows = (
+        supabase.table("alerts")
+        .select("*, users(telegram_bot_token, telegram_chat_id)")
+        .eq("active", True)
+        .execute()
+    )
+    alerts = rows.data
+    if not alerts:
+        return
+
+    log.info(f"Scraper: scanning {len(alerts)} alerts")
+
+    for alert in alerts:
+        user_data    = alert.get("users") or {}
+        bot_token    = user_data.get("telegram_bot_token") or TELEGRAM_BOT_TOKEN
+        chat_id      = user_data.get("telegram_chat_id") or TELEGRAM_CHAT_ID
+        brand        = alert["brand"]
+        keywords     = alert.get("keywords", [])
+        max_price    = alert.get("max_price_gbp", 9999)
+
+        search_terms = [f"{brand} {kw}" for kw in keywords[:2]] + [brand]
+
+        for term in search_terms[:2]:
+            encoded = url_quote(term)
+            feeds = [
+                {"platform": "eBay UK",  "url": f"https://www.ebay.co.uk/sch/i.html?_nkw={encoded}&_sop=10&_rss=1&LH_BIN=1"},
+                {"platform": "eBay US",  "url": f"https://www.ebay.com/sch/i.html?_nkw={encoded}&_sop=10&_rss=1"},
+                {"platform": "Vinted",   "url": f"https://www.vinted.co.uk/catalog/rss?search_text={encoded}"},
+            ]
+
+            for feed_info in feeds:
+                try:
+                    feed    = feedparser.parse(feed_info["url"])
+                    entries = feed.entries[:15]
+
+                    for entry in entries:
+                        title = entry.get("title", "")
+                        url   = entry.get("link", "")
+                        lid   = hashlib.md5(f"{url}{title}".encode()).hexdigest()
+
+                        if lid in _seen_listings:
+                            continue
+                        _seen_listings.add(lid)
+
+                        title_lower = title.lower()
+                        if not (brand.lower() in title_lower or
+                                any(k.lower() in title_lower for k in keywords)):
+                            continue
+
+                        price_text = title + " " + entry.get("summary", "") + " " + entry.get("price", "")
+                        price = extract_price_gbp(price_text)
+
+                        if price and price > max_price:
+                            continue
+
+                        analysis = run_quick_analysis(title, price or "unknown", feed_info["platform"], alert)
+
+                        if (analysis.get("flipScore", 0) >= MIN_FLIP_SCORE and
+                                analysis.get("verdict") not in ["SKIP", "WAIT"]):
+                            msg = build_telegram_message(title, price, feed_info["platform"], analysis, url, alert)
+                            send_telegram_alert(msg, chat_id, bot_token)
+                            log.info(f"Alert sent: {analysis['verdict']} — {title[:50]}")
+
+                        time.sleep(0.3)
+
+                except Exception as e:
+                    log.error(f"Feed error ({feed_info['platform']}): {e}")
+                    continue
+
+    # Trim seen set to avoid memory bloat
+    if len(_seen_listings) > 10000:
+        trimmed = list(_seen_listings)[-5000:]
+        _seen_listings.clear()
+        _seen_listings.update(trimmed)
+
+
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+def startup():
+    log.info("ARCHIVR API starting up")
+    t = threading.Thread(target=scraper_loop, daemon=True)
+    t.start()
+    log.info("Scraper thread launched")
