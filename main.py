@@ -87,6 +87,62 @@ class CheckoutRequest(BaseModel):
     success_url: str
     cancel_url: str
 
+# ─── TIER LIMITS ─────────────────────────────────────────────────────────────
+
+TIER_LIMITS = {
+    "starter": {"analyses_per_month": 100,    "alerts_max": 5},
+    "pro":     {"analyses_per_month": 500,    "alerts_max": 20},
+    "store":   {"analyses_per_month": 999999, "alerts_max": 999999},
+}
+
+PRICE_TO_TIER = {
+    os.environ.get("STRIPE_PRICE_ID_STARTER", ""): "starter",
+    os.environ.get("STRIPE_PRICE_ID",          ""): "pro",
+    os.environ.get("STRIPE_PRICE_ID_STORE",    ""): "store",
+}
+
+def get_user_tier(user: dict) -> str:
+    price_id = user.get("stripe_price_id", "")
+    return PRICE_TO_TIER.get(price_id, "pro")
+
+def get_monthly_usage(user_id: str) -> int:
+    from datetime import date
+    month_start = date.today().replace(day=1).isoformat()
+    try:
+        result = (
+            supabase.table("analyses")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .gte("created_at", month_start)
+            .execute()
+        )
+        return result.count or 0
+    except Exception:
+        return 0
+
+def check_usage_limit(user: dict):
+    tier     = get_user_tier(user)
+    limits   = TIER_LIMITS.get(tier, TIER_LIMITS["pro"])
+    max_uses = limits["analyses_per_month"]
+    used     = get_monthly_usage(user["id"])
+    if used >= max_uses:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly limit of {max_uses} analyses reached. Upgrade your plan at archivr.app"
+        )
+    return {"used": used, "limit": max_uses, "tier": tier}
+
+def check_alert_limit(user: dict, current_alert_count: int):
+    tier       = get_user_tier(user)
+    limits     = TIER_LIMITS.get(tier, TIER_LIMITS["pro"])
+    max_alerts = limits["alerts_max"]
+    if current_alert_count >= max_alerts:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Alert limit of {max_alerts} reached on your plan. Upgrade at archivr.app"
+        )
+
+
 # ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 
 def get_user_from_token(token: str) -> dict:
@@ -351,6 +407,7 @@ async def analyse_listing(
     token = authorization.replace("Bearer ", "").strip()
     user  = get_user_from_token(token)
     require_active_subscription(user)
+    check_usage_limit(user)
 
     try:
         result = run_ai_analysis(body.dict())
@@ -402,6 +459,10 @@ async def create_alert(
     user  = get_user_from_token(token)
     require_active_subscription(user)
 
+    # Check alert limit for this tier
+    existing = supabase.table("alerts").select("id", count="exact").eq("user_id", user["id"]).eq("active", True).execute()
+    check_alert_limit(user, existing.count or 0)
+
     row = supabase.table("alerts").insert({
         "user_id":       user["id"],
         "brand":         body.brand,
@@ -445,10 +506,17 @@ async def get_analysis_history(authorization: str = Header(...)):
 async def get_me(authorization: str = Header(...)):
     token = authorization.replace("Bearer ", "").strip()
     user  = get_user_from_token(token)
+    usage = get_monthly_usage(user["id"])
+    tier  = get_user_tier(user)
+    limits = TIER_LIMITS.get(tier, TIER_LIMITS["pro"])
     return {
         "email": user["email"],
         "subscription_status": user["subscription_status"],
         "created_at": user["created_at"],
+        "tier": tier,
+        "analyses_used": usage,
+        "analyses_limit": limits["analyses_per_month"],
+        "alerts_limit": limits["alerts_max"],
     }
 
 # ─── SCRAPER ─────────────────────────────────────────────────────────────────
