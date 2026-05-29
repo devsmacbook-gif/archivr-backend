@@ -616,6 +616,13 @@ def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[di
                 "els => els.map(e => ({href: e.href, text: e.innerText.trim()}))"
             )
             content = page.content()
+            page_title = page.title()
+            log.info(f"Mercari JP page title: {page_title[:80]}")
+            log.info(f"Mercari JP links found: {len(all_links)}")
+            log.info(f"Mercari JP content length: {len(content)}")
+            # Check for CAPTCHA or block
+            if "captcha" in content.lower() or "blocked" in content.lower():
+                log.error("Mercari JP CAPTCHA or block detected")
             browser.close()
 
         # Extract item IDs from links
