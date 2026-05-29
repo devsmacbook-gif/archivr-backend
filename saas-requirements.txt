@@ -6,3 +6,4 @@ stripe==11.1.0
 requests==2.32.3
 pydantic==2.9.2
 python-multipart==0.0.12
+playwright==1.44.0

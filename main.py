@@ -656,195 +656,98 @@ def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[di
 
 
 
-# ─── APIFY SCRAPER ────────────────────────────────────────────────────────────
-# Uses Apify cloud scrapers — no IP blocking, no rate limits, flat monthly cost
+# ─── PLAYWRIGHT SCRAPER ──────────────────────────────────────────────────────
+# Uses headless Chrome via Playwright — installed in Docker on Railway
+# Smart delays and user-agent rotation to avoid rate limiting
 
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
-APIFY_ACTORS = {
-    "mercari_jp": "curious_coder/mercari-scraper",
-    "yahoo_jp":   "styleindexamerica/jp-yahooauctions-scraper", 
-    "vinted":     "emastra/vinted-scraper",
-    "depop":      "apify/depop-scraper",
-}
+import random
 
-def _apify_run(actor_id: str, input_data: dict, timeout_secs: int = 60) -> list[dict]:
-    """Run an Apify actor and return results."""
-    if not APIFY_TOKEN:
-        log.warning("APIFY_TOKEN not set — skipping Apify scrape")
-        return []
+PLAYWRIGHT_USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
+    """Fetch Mercari Japan listings using Playwright with smart delays."""
+    from playwright.sync_api import sync_playwright
+    JPY_TO_GBP = 0.0052
+    listings = []
+
+    # Random delay before each request to avoid rate limiting
+    time.sleep(random.uniform(8, 15))
 
     try:
-        # Start the actor run
-        run_url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
-        resp = requests.post(
-            run_url,
-            json=input_data,
-            headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
-            timeout=timeout_secs,
-            params={"token": APIFY_TOKEN},
-        )
-        if resp.status_code == 200:
-            return resp.json() if isinstance(resp.json(), list) else []
-        else:
-            log.error(f"Apify error {resp.status_code}: {resp.text[:200]}")
-            return []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(PLAYWRIGHT_USER_AGENTS),
+                locale="en-GB",
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+            )
+            page = context.new_page()
+            url = f"https://jp.mercari.com/search?keyword={url_quote(query)}&status=on_sale&sort=created_time&order=desc"
+
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(random.randint(2000, 4000))
+
+            all_links = page.eval_on_selector_all(
+                "a[href*='/item/m']",
+                "els => els.map(e => ({href: e.href, text: e.innerText.trim()}))"
+            )
+            content = page.content()
+            browser.close()
+
+        item_ids = []
+        seen_ids = set()
+        for link in all_links:
+            m = re.search(r"/(m\d+)", link.get("href", ""))
+            if m and m.group(1) not in seen_ids:
+                seen_ids.add(m.group(1))
+                item_ids.append(m.group(1))
+
+        names_map  = {}
+        prices_map = {}
+        for pat in [
+            r'"id":"(m\d+)"[^}]*?"name":"([^"]{5,100})"[^}]*?"price":(\d+)',
+            r'"itemId":"(m\d+)"[^}]*?"itemName":"([^"]{5,100})"[^}]*?"price":(\d+)',
+        ]:
+            for item_id, name, price in re.findall(pat, content):
+                names_map[item_id]  = name
+                prices_map[item_id] = int(price)
+
+        for item_id in item_ids[:20]:
+            name      = names_map.get(item_id, "")
+            price_jpy = prices_map.get(item_id, 0)
+            if not name or not price_jpy or price_jpy < 100:
+                continue
+            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
+            if max_price_gbp and price_gbp > max_price_gbp:
+                continue
+            listings.append({
+                "title":    name,
+                "price":    price_gbp,
+                "price_jpy": price_jpy,
+                "link":     f"https://jp.mercari.com/item/{item_id}",
+                "platform": "Mercari JP",
+            })
     except Exception as e:
-        log.error(f"Apify request failed: {e}")
-        return []
+        log.error(f"Mercari JP fetch error: {e}")
 
-
-def _search_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
-    """Search Mercari Japan via Apify."""
-    JPY_TO_GBP = 0.0052
-    
-    results = _apify_run(
-        APIFY_ACTORS["mercari_jp"],
-        {
-            "keyword": query,
-            "maxItems": 30,
-            "status": "on_sale",
-            "sortBy": "created_time",
-        }
-    )
-
-    listings = []
-    for item in results:
-        try:
-            title     = item.get("name") or item.get("title") or item.get("itemName", "")
-            price_jpy = int(item.get("price") or item.get("sellingPrice") or 0)
-            item_id   = item.get("id") or item.get("itemId", "")
-            if not title or not price_jpy:
-                continue
-            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
-            if max_price_gbp and price_gbp > max_price_gbp:
-                continue
-            listings.append({
-                "title":     title,
-                "price":     price_gbp,
-                "price_jpy": price_jpy,
-                "link":      f"https://jp.mercari.com/item/{item_id}" if item_id else "",
-                "platform":  "Mercari JP",
-            })
-        except Exception:
-            continue
-    return listings
-
-
-def _search_yahoo_jp(query: str, max_price_gbp: float | None = None) -> list[dict]:
-    """Search Yahoo Auctions Japan via Apify."""
-    JPY_TO_GBP = 0.0052
-
-    results = _apify_run(
-        APIFY_ACTORS["yahoo_jp"],
-        {
-            "keyword": query,
-            "maxItems": 30,
-        }
-    )
-
-    listings = []
-    for item in results:
-        try:
-            title     = item.get("title") or item.get("name", "")
-            price_raw = item.get("price") or item.get("currentPrice") or item.get("buyNowPrice") or 0
-            price_jpy = int(re.sub(r"[^\d]", "", str(price_raw))) if price_raw else 0
-            link      = item.get("url") or item.get("itemUrl", "")
-            if not title or not price_jpy:
-                continue
-            price_gbp = round(price_jpy * JPY_TO_GBP, 2)
-            if max_price_gbp and price_gbp > max_price_gbp:
-                continue
-            listings.append({
-                "title":     title,
-                "price":     price_gbp,
-                "price_jpy": price_jpy,
-                "link":      link,
-                "platform":  "Yahoo JP",
-            })
-        except Exception:
-            continue
-    return listings
-
-
-def _search_vinted(query: str, max_price_gbp: float | None = None) -> list[dict]:
-    """Search Vinted UK via Apify."""
-    input_data = {
-        "searchQuery": query,
-        "maxItems": 30,
-        "country": "uk",
-    }
-    if max_price_gbp:
-        input_data["maxPrice"] = max_price_gbp
-
-    results = _apify_run(APIFY_ACTORS["vinted"], input_data)
-
-    listings = []
-    for item in results:
-        try:
-            title     = item.get("title") or item.get("name", "")
-            price_gbp = float(item.get("price") or item.get("priceAmount") or 0)
-            link      = item.get("url") or item.get("itemUrl", "")
-            if not title or not price_gbp:
-                continue
-            if max_price_gbp and price_gbp > max_price_gbp:
-                continue
-            listings.append({
-                "title":    title,
-                "price":    round(price_gbp, 2),
-                "link":     link,
-                "platform": "Vinted",
-            })
-        except Exception:
-            continue
-    return listings
-
-
-def _search_depop(query: str, max_price_gbp: float | None = None) -> list[dict]:
-    """Search Depop via Apify."""
-    results = _apify_run(
-        APIFY_ACTORS["depop"],
-        {
-            "searchQuery": query,
-            "maxItems": 30,
-        }
-    )
-
-    listings = []
-    for item in results:
-        try:
-            title     = item.get("title") or item.get("name", "")
-            price_gbp = float(item.get("price") or item.get("priceAmount") or 0)
-            link      = item.get("url") or item.get("itemUrl", "")
-            if not title or not price_gbp:
-                continue
-            if max_price_gbp and price_gbp > max_price_gbp:
-                continue
-            listings.append({
-                "title":    title,
-                "price":    round(price_gbp, 2),
-                "link":     link,
-                "platform": "Depop",
-            })
-        except Exception:
-            continue
-    return listings
+    return listings[:10]
 
 
 def _search_all_platforms(query: str, max_price_gbp: float | None = None) -> list[dict]:
-    """Search all platforms and combine results."""
+    """Search all available platforms."""
     all_listings = []
-    
-    # Always search Mercari JP and Yahoo JP (Japan arbitrage)
-    all_listings.extend(_search_mercari_jp(query, max_price_gbp))
-    all_listings.extend(_search_yahoo_jp(query, max_price_gbp))
-    
-    # UK platforms
-    all_listings.extend(_search_vinted(query, max_price_gbp))
-    all_listings.extend(_search_depop(query, max_price_gbp))
-    
+    all_listings.extend(_fetch_mercari_jp(query, max_price_gbp))
     return all_listings
-
 
 def _run_scraper_cycle():
     """Scan all platforms via Apify for all active user alerts."""
