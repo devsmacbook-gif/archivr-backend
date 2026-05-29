@@ -50,6 +50,10 @@ TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")  # your own alert
 SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "15"))
 MIN_FLIP_SCORE        = int(os.environ.get("MIN_FLIP_SCORE", "65"))
 APIFY_TOKEN           = os.environ.get("APIFY_TOKEN", "")
+PROXY_HOST            = os.environ.get("PROXY_HOST", "")
+PROXY_PORT            = os.environ.get("PROXY_PORT", "")
+PROXY_USER            = os.environ.get("PROXY_USER", "")
+PROXY_PASS            = os.environ.get("PROXY_PASS", "")
 
 # ─── CLIENTS ─────────────────────────────────────────────────────────────────
 
@@ -682,12 +686,23 @@ def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[di
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
+            # Build proxy config if available
+            proxy_config = None
+            if PROXY_HOST and PROXY_PORT:
+                proxy_config = {
+                    "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+                    "username": PROXY_USER,
+                    "password": PROXY_PASS,
+                }
+                log.info(f"Using proxy: {PROXY_HOST}:{PROXY_PORT}")
+
             context = browser.new_context(
                 user_agent=random.choice(PLAYWRIGHT_USER_AGENTS),
-                locale="en-GB",
+                locale="ja-JP",
                 viewport={"width": 1280, "height": 800},
+                proxy=proxy_config,
                 extra_http_headers={
-                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 }
             )
