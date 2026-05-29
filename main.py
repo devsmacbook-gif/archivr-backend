@@ -694,8 +694,8 @@ def _fetch_mercari_jp(query: str, max_price_gbp: float | None = None) -> list[di
             page = context.new_page()
             url = f"https://jp.mercari.com/search?keyword={url_quote(query)}&status=on_sale&sort=created_time&order=desc"
 
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(random.randint(2000, 4000))
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(random.randint(3000, 5000))
 
             all_links = page.eval_on_selector_all(
                 "a[href*='/item/m']",
